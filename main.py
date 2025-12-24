@@ -14,10 +14,9 @@ server = Flask('')
 
 @server.route('/')
 def home():
-    return "Bot is alive!"
+    return "Bot is alive and running!"
 
 def run_flask():
-    # Render provides a PORT environment variable automatically
     port = int(os.environ.get("PORT", 8080))
     server.run(host='0.0.0.0', port=port)
 
@@ -32,7 +31,7 @@ REDIRECT_URI = 'urn:ietf:wg:oauth:2.0:oob'
 
 bot = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
-# --- Progress & Disk Helpers ---
+# --- Progress Helpers ---
 def get_progress_bar(current, total):
     if not total or total == 0: return "[░░░░░░░░░░] 0%"
     percentage = current / total
@@ -43,10 +42,10 @@ async def fast_download(client, message, path, status_msg):
     current_downloaded = 0
     total_size = message.file.size
     
-    # Check disk space (Render free tier has ~500MB-1GB disk limit)
-    total, used, free = shutil.disk_usage("/")
-    if free < (total_size + 100 * 1024 * 1024):
-        raise Exception(f"Insufficient Disk Space! File: {total_size/1024**2:.1f}MB, Free: {free/1024**2:.1f}MB")
+    # Check disk space in /tmp
+    total, used, free = shutil.disk_usage("/tmp")
+    if free < (total_size + 50 * 1024 * 1024):
+        raise Exception(f"Render Disk Full! Free: {free/1024**2:.1f}MB, Needed: {total_size/1024**2:.1f}MB")
 
     def progress_callback(received, total):
         nonlocal current_downloaded
@@ -61,10 +60,10 @@ async def fast_download(client, message, path, status_msg):
         pc = int((current_downloaded / total_size) * 100) if total_size else 0
         if pc != last_pc:
             try:
-                await status_msg.edit(f"📥 **Downloading...**\n{get_progress_bar(current_downloaded, total_size)}")
+                await status_msg.edit(f"📥 **Downloading to Temp...**\n{get_progress_bar(current_downloaded, total_size)}")
                 last_pc = pc
             except: pass
-        await asyncio.sleep(5)
+        await asyncio.sleep(4)
     
     return await download_task
 
@@ -81,7 +80,7 @@ user_creds = load_creds()
 async def start(event):
     flow = Flow.from_client_secrets_file(CLIENT_SECRETS_FILE, scopes=SCOPES, redirect_uri=REDIRECT_URI)
     auth_url, _ = flow.authorization_url(prompt='consent')
-    await event.respond(f"🚀 **Bot Active on Render**\n\n1. [Authorize Google Drive]({auth_url})\n2. Paste code here.", link_preview=False)
+    await event.respond(f"🚀 **Render Bot Connected**\n\n1. [Authorize Google Drive]({auth_url})\n2. Paste code here.", link_preview=False)
 
 @bot.on(events.NewMessage())
 async def main_handler(event):
@@ -99,17 +98,24 @@ async def main_handler(event):
     if event.file:
         if user_id not in user_creds:
             return await event.respond("Connect Drive first via /start")
-        status_msg = await event.respond("⚡ **Processing...**")
         
-        temp_filename = f"dl_{user_id}.dat"
-        full_path = os.path.join(os.getcwd(), temp_filename)
+        status_msg = await event.respond("⚡ **Starting...**")
+        
+        # FIX: Using /tmp for all Render operations
+        temp_filename = f"render_dl_{user_id}.dat"
+        full_path = os.path.join("/tmp", temp_filename)
         
         try:
+            # 1. Download
             await fast_download(bot, event, full_path, status_msg)
-            await asyncio.sleep(2)
+            
+            # Verify existence immediately
+            if not os.path.exists(full_path):
+                raise FileNotFoundError("System failed to lock file in /tmp")
 
+            # 2. Upload
             service = build('drive', 'v3', credentials=user_creds[user_id])
-            media = MediaFileUpload(full_path, resumable=True, chunksize=10*1024*1024)
+            media = MediaFileUpload(full_path, resumable=True, chunksize=5*1024*1024)
             request = service.files().create(
                 body={'name': event.file.name or "file"}, 
                 media_body=media, 
@@ -121,13 +127,15 @@ async def main_handler(event):
             while response is None:
                 status, response = request.next_chunk()
                 if status:
-                    await status_msg.edit(f"📤 **Uploading...**\n{get_progress_bar(status.resumable_progress, status.total_size)}")
+                    await status_msg.edit(f"📤 **Uploading to Drive...**\n{get_progress_bar(status.resumable_progress, status.total_size)}")
             
             await status_msg.delete()
             await event.respond(f"✅ **Success!**", buttons=[Button.inline("🔓 Make Public", data=f"pub_{response.get('id')}")])
-        except Exception as e: await event.respond(f"❌ Error: {str(e)}")
+        except Exception as e: 
+            await event.respond(f"❌ Render Error: {str(e)}")
         finally: 
-            if os.path.exists(full_path): os.remove(full_path)
+            if os.path.exists(full_path):
+                os.remove(full_path)
 
 @bot.on(events.CallbackQuery(pattern=b'pub_'))
 async def pub_callback(event):
@@ -138,8 +146,6 @@ async def pub_callback(event):
     await event.edit(f"✅ **Public Link:**\n{file.get('webViewLink')}")
 
 if __name__ == '__main__':
-    # Start the Flask web server in a separate thread
     t = Thread(target=run_flask)
     t.start()
-    print("Web server started, now running Bot...")
     bot.run_until_disconnected()
